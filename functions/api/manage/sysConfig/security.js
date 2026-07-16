@@ -1,6 +1,6 @@
 import { getDatabase } from '../../../utils/databaseAdapter.js';
 import { hashPassword, isHashed } from '../../../utils/auth/passwordHash.js';
-import { destroySessionsByAuthType } from '../../../utils/auth/sessionManager.js';
+import { destroySessionsByAuthType, buildClearCookie } from '../../../utils/auth/sessionManager.js';
 import { normalizeSessionMaxAgeDays } from '../../../utils/auth/sessionConfig.js';
 
 export async function onRequest(context) {
@@ -106,23 +106,29 @@ export async function onRequest(context) {
         // 写入数据库
         await db.put('manage@sysConfig@security', JSON.stringify(settings))
 
-        // 密码变更后清除对应类型的所有会话
+        // 密码变更后清除对应类型的所有会话 + 清除客户端 Cookie
+        const clearCookies = [];
         if (userPasswordChanged) {
             await destroySessionsByAuthType(env, 'user');
+            clearCookies.push(await buildClearCookie(env, 'user'));
         }
         if (adminPasswordChanged) {
             await destroySessionsByAuthType(env, 'admin');
+            clearCookies.push(await buildClearCookie(env, 'admin'));
+        }
+
+        const headers = new Headers({
+            'content-type': 'application/json',
+        });
+        for (const cookie of clearCookies) {
+            headers.append('Set-Cookie', cookie);
         }
 
         return new Response(JSON.stringify({
             message: 'security settings saved',
             userPasswordChanged,
             adminPasswordChanged,
-        }), {
-            headers: {
-                'content-type': 'application/json',
-            },
-        })
+        }), { headers });
     }
 
 }

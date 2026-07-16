@@ -1,4 +1,5 @@
 import { authenticate, AUTH_SCOPE } from "../../utils/auth/authCore.js";
+import { validateCsrfToken } from "../../utils/auth/sessionManager.js";
 
 const DEFAULT_MANAGE_CACHE_CONTROL = 'private, no-store, max-age=0';
 
@@ -37,7 +38,6 @@ function UnauthorizedException(reason) {
     headers: {
       'Content-Type': 'text/plain;charset=UTF-8',
       'Cache-Control': 'no-store',
-      'Content-Length': reason.length,
     },
   });
 }
@@ -62,20 +62,37 @@ function extractRequiredPermission(pathname) {
   return 'manage';
 }
 
-// CORS 跨域响应头
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, DELETE, PUT, PATCH, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  'Access-Control-Max-Age': '86400',
-};
+/**
+ * 获取允许的 CORS Origin（从环境变量或默认值）
+ */
+function getAllowedOrigin(request) {
+  const origin = request.headers.get('Origin');
+  if (!origin) return null;
+  // 允许同源请求（null origin 表示同源）
+  const url = new URL(request.url);
+  if (origin === url.origin) return origin;
+  // 可在此处添加额外的白名单域名
+  return url.origin; // 默认仅允许同源
+}
+
+// CORS 响应头构建
+function buildCorsHeaders(request) {
+  const allowedOrigin = getAllowedOrigin(request);
+  return {
+    'Access-Control-Allow-Origin': allowedOrigin || '',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, PUT, PATCH, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-CSRF-Token',
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Max-Age': '86400',
+  };
+}
 
 async function authentication(context) {
   // OPTIONS 预检请求不需要鉴权，直接返回 CORS 响应
   if (context.request.method === 'OPTIONS') {
     return new Response(null, {
       status: 204,
-      headers: corsHeaders
+      headers: buildCorsHeaders(context.request),
     });
   }
 
@@ -91,6 +108,21 @@ async function authentication(context) {
 
   if (!result.authorized) {
     return UnauthorizedException('You need to login');
+  }
+
+  // CSRF 防护：对非 GET/HEAD/OPTIONS 请求验证 CSRF Token
+  const method = context.request.method.toUpperCase();
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    const csrfValid = await validateCsrfToken(context.env, context.request, 'admin');
+    if (!csrfValid) {
+      return new Response('CSRF token invalid or missing', {
+        status: 403,
+        headers: {
+          'Content-Type': 'text/plain;charset=UTF-8',
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
   }
 
   return context.next();

@@ -22,7 +22,7 @@ const COOKIE_NAMES = {
  * @param {Object} env - 环境变量
  * @param {string} authType - 认证类型 ('admin' | 'user')
  * @param {string} [username] - 用户名（管理员登录时使用）
- * @returns {Promise<{token: string, cookie: string}>}
+ * @returns {Promise<{token: string, cookie: string, csrfToken: string}>}
  */
 export async function createSession(env, authType, username = '') {
     // 读取安全策略配置
@@ -37,9 +37,11 @@ export async function createSession(env, authType, username = '') {
 
     const db = getDatabase(env);
     const token = generateSessionToken();
+    const csrfToken = generateSessionToken(); // 独立的 CSRF token
     const sessionData = {
         authType,
         username,
+        csrfToken,
         createdAt: Date.now(),
         expiresAt: Date.now() + maxAge * 1000,
     };
@@ -50,7 +52,7 @@ export async function createSession(env, authType, username = '') {
 
     const cookieName = COOKIE_NAMES[authType] || 'session';
     const cookie = buildSessionCookie(cookieName, token, maxAge, secure);
-    return { token, cookie };
+    return { token, cookie, csrfToken };
 }
 
 /**
@@ -185,6 +187,52 @@ export async function destroySessionsByAuthType(env, authType) {
     }
 
     return destroyed;
+}
+
+/**
+ * 验证 CSRF Token
+ * @param {Object} env - 环境变量
+ * @param {Request} request - 请求对象
+ * @param {string} authType - 认证类型 ('admin' | 'user')
+ * @returns {Promise<boolean>}
+ */
+export async function validateCsrfToken(env, request, authType) {
+    const csrfHeader = request.headers.get('X-CSRF-Token');
+    if (!csrfHeader) {
+        return false;
+    }
+
+    const cookieName = COOKIE_NAMES[authType] || 'session';
+    const token = getCookieValue(request, cookieName);
+    if (!token) {
+        return false;
+    }
+
+    const db = getDatabase(env);
+    const sessionStr = await db.get(`${SESSION_PREFIX}${token}`);
+    if (!sessionStr) {
+        return false;
+    }
+
+    try {
+        const session = JSON.parse(sessionStr);
+        return session.csrfToken === csrfHeader;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * 构建清除 Cookie 的 Set-Cookie 头（用于密码修改等场景）
+ * @param {Object} env - 环境变量
+ * @param {string} authType - 清除的认证类型
+ * @returns {Promise<string>}
+ */
+export async function buildClearCookie(env, authType) {
+    const securityConfig = await fetchSecurityConfig(env);
+    const secure = securityConfig.access?.sessionSecure ?? false;
+    const cookieName = COOKIE_NAMES[authType] || 'session';
+    return buildSessionCookie(cookieName, '', 0, secure);
 }
 
 /**

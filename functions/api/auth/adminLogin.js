@@ -3,10 +3,37 @@ import { verifyPassword, rehashIfNeeded } from "../../utils/auth/passwordHash.js
 import { createSession } from "../../utils/auth/sessionManager.js";
 import { getDatabase } from "../../utils/databaseAdapter.js";
 
+// 速率限制配置
+const RATE_LIMIT_PREFIX = 'rate@adminLogin@';
+const MAX_FAILED_ATTEMPTS = 5;
+const RATE_LIMIT_WINDOW = 900; // 15分钟
+
 export async function onRequestPost(context) {
     const { request, env } = context;
 
-    const { username, password } = await request.json();
+    const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
+    const failKey = `${RATE_LIMIT_PREFIX}${clientIp}`;
+
+    // 速率限制检查
+    const db = getDatabase(env);
+    const failCount = parseInt(await db.get(failKey) || '0', 10);
+    if (failCount >= MAX_FAILED_ATTEMPTS) {
+        return new Response(JSON.stringify({ error: 'Too many login attempts. Please try again later.' }), {
+            status: 429,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
+    let body;
+    try {
+        body = await request.json();
+    } catch {
+        return new Response(JSON.stringify({ error: 'Invalid request body' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+    const { username, password } = body;
 
     // 读取安全设置
     let securityConfig;
@@ -26,21 +53,22 @@ export async function onRequestPost(context) {
     const passwordConfigured = !!(adminPassword && adminPassword.trim());
     const adminConfigured = usernameConfigured || passwordConfigured;
 
-    // 管理员未配置，无需认证，直接创建会话
+    // 漏洞修复：管理员未配置时拒绝登录，不再自动创建 session
     if (!adminConfigured) {
-        const { cookie } = await createSession(env, 'admin');
-        return new Response(JSON.stringify({ success: true }), {
-            status: 200,
-            headers: {
-                'Content-Type': 'application/json',
-                'Set-Cookie': cookie,
-            },
+        console.warn(`Admin login attempted from ${clientIp} but no admin credentials configured`);
+        return new Response(JSON.stringify({
+            error: 'Admin account not configured',
+            hint: 'Please set BASIC_USER/BASIC_PASS environment variables in Cloudflare Dashboard.'
+        }), {
+            status: 403,
+            headers: { 'Content-Type': 'application/json' },
         });
     }
 
     // 如果设置了用户名，则验证用户名
     if (usernameConfigured && username !== adminUsername) {
-        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        await db.put(failKey, String(failCount + 1), { expirationTtl: RATE_LIMIT_WINDOW });
+        return new Response(JSON.stringify({ error: 'Invalid credentials' }), {
             status: 401,
             headers: { 'Content-Type': 'application/json' },
         });
@@ -50,20 +78,22 @@ export async function onRequestPost(context) {
     if (passwordConfigured) {
         const passwordMatch = await verifyPassword(password, adminPassword);
         if (!passwordMatch) {
-            return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            await db.put(failKey, String(failCount + 1), { expirationTtl: RATE_LIMIT_WINDOW });
+            return new Response(JSON.stringify({ error: 'Invalid credentials' }), {
                 status: 401,
                 headers: { 'Content-Type': 'application/json' },
             });
         }
 
-        // 登录成功后，自动升级旧版哈希为 PBKDF2
+        // 登录成功后清除失败计数并升级哈希
+        await db.delete(failKey);
         await rehashIfNeeded(getDatabase(env), password, adminPassword, 'auth.admin.adminPassword');
     }
 
-    // 创建会话并通过 HttpOnly Cookie 返回
-    const { cookie } = await createSession(env, 'admin');
+    // 创建会话并通过 HttpOnly Cookie 返回（含 CSRF token）
+    const { cookie, csrfToken } = await createSession(env, 'admin', username);
 
-    return new Response(JSON.stringify({ success: true }), {
+    return new Response(JSON.stringify({ success: true, csrfToken }), {
         status: 200,
         headers: {
             'Content-Type': 'application/json',
